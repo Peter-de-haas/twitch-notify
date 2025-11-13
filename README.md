@@ -9,3 +9,6 @@ Four states are possible
 * X was live, and is live = flag file exists, does not send notification
 * X was live, and is not live = flag file exists, deletes flag file, does not send notification
 * X was not live and is not live = does not send notification
+
+#testing
+once again testing to see if I can auth now
