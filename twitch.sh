@@ -1,59 +1,136 @@
 #!/bin/bash
 # twitch_check.sh
 # Usage: ./twitch_check.sh <streamer_name>
+# Hardened version with logging, retries, and credential file
+
+set -euo pipefail
+IFS=$'\n\t'
+
+# ------------------------------
+# CONFIG
+# ------------------------------
 
 STREAMER="$1"
-CLIENT_ID="Enter Twitch client id"
-CLIENT_SECRET="Enter Twitch Secret"
-TOKEN_FILE="/tmp/twitch_token.json"
-FLAG_FILE="/tmp/${STREAMER}_live.flag"
-WEBHOOK_URL="Paste full discord webhook url"
+CRED_FILE="/home/cronrunner/credentials/twitch-sh-credentials.conf"
+LOG_FILE="/var/log/twitch_check.log"
 
-if [ -z "$STREAMER" ]; then
-    echo "Usage: $0 <streamer_name>"
+TOKEN_FILE="/tmp/twitch_${STREAMER}_token.json"
+FLAG_FILE="/tmp/${STREAMER}_live.flag"
+
+# ------------------------------
+# FUNCTIONS
+# ------------------------------
+
+log() {
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" >> "$LOG_FILE"
+}
+
+error_exit() {
+    log "ERROR: $*"
+    echo "ERROR: $*" >&2
     exit 1
-fi
-# create new twitch.tv token in TOKEN_FILE
+}
+
+# Retry function for curl
+retry_curl() {
+    local url="$1"
+    shift
+    local retries=3
+    local delay=2
+    local attempt=1
+    local response
+    while [ $attempt -le $retries ]; do
+        response=$(curl --fail -s "$@" "$url") && echo "$response" && return 0
+        log "Curl attempt $attempt failed, retrying in $delay seconds..."
+        sleep $delay
+        attempt=$((attempt + 1))
+        delay=$((delay * 2))
+    done
+    error_exit "Curl failed after $retries attempts: $url"
+}
+
+# Generate a new Twitch API token
 get_token() {
-    curl -s -X POST "https://id.twitch.tv/oauth2/token" \
+    log "Requesting new Twitch token..."
+    retry_curl "https://id.twitch.tv/oauth2/token" \
+        -X POST \
         -H "Content-Type: application/x-www-form-urlencoded" \
         -d "client_id=$CLIENT_ID&client_secret=$CLIENT_SECRET&grant_type=client_credentials" \
         > "$TOKEN_FILE"
 }
 
-if [ ! -f "$TOKEN_FILE" ]; then
-    get_tokenz
+# ------------------------------
+# VALIDATION
+# ------------------------------
+
+if [ -z "${STREAMER}" ]; then
+    echo "Usage: $0 <streamer_name>"
+    exit 1
 fi
 
-# variable declaration
-ACCESS_TOKEN=$(jq -r '.access_token' "$TOKEN_FILE" 2>/dev/null)
-EXPIRES_IN=$(jq -r '.expires_in' "$TOKEN_FILE" 2>/dev/null)
-OBTAINED_AT=$(stat -c %Y "$TOKEN_FILE" 2>/dev/null)
+if [ ! -f "$CRED_FILE" ]; then
+    error_exit "Credential file not found: $CRED_FILE"
+fi
+
+# Load credentials
+source "$CRED_FILE"
+
+: "${CLIENT_ID:?Missing CLIENT_ID in $CRED_FILE}"
+: "${CLIENT_SECRET:?Missing CLIENT_SECRET in $CRED_FILE}"
+: "${WEBHOOK_URL:?Missing WEBHOOK_URL in $CRED_FILE}"
+
+# ------------------------------
+# TOKEN MANAGEMENT
+# ------------------------------
+
+if [ ! -f "$TOKEN_FILE" ]; then
+    get_token
+fi
+
+ACCESS_TOKEN=$(jq -r '.access_token // empty' "$TOKEN_FILE")
+EXPIRES_IN=$(jq -r '.expires_in // 0' "$TOKEN_FILE")
+OBTAINED_AT=$(stat -c %Y "$TOKEN_FILE" 2>/dev/null || echo 0)
 NOW=$(date +%s)
 
-# check if token is already expired, run get_token()
 if [ -z "$ACCESS_TOKEN" ] || [ $((NOW - OBTAINED_AT)) -ge "$EXPIRES_IN" ]; then
     get_token
-    ACCESS_TOKEN=$(jq -r '.access_token' "$TOKEN_FILE")
+    ACCESS_TOKEN=$(jq -r '.access_token // empty' "$TOKEN_FILE")
 fi
 
-RESPONSE=$(curl -s -H "Client-ID: $CLIENT_ID" \
-    -H "Authorization: Bearer $ACCESS_TOKEN" \
-    "https://api.twitch.tv/helix/streams?user_login=$STREAMER")
+# ------------------------------
+# CALL TWITCH API
+# ------------------------------
 
-# building the payload
-IS_LIVE=$(echo "$RESPONSE" | jq -r '.data[0].type')
-TITLE=$(echo "$RESPONSE" | jq -r '.data[0].title')
-GAME=$(echo "$RESPONSE" | jq -r '.data[0].game_name')
+RESPONSE=$(retry_curl "https://api.twitch.tv/helix/streams?user_login=$STREAMER" \
+    -H "Client-ID: $CLIENT_ID" \
+    -H "Authorization: Bearer $ACCESS_TOKEN"
+)
+
+# Validate API response
+if ! echo "$RESPONSE" | jq -e '.data' >/dev/null 2>&1; then
+    error_exit "Invalid Twitch API response: $RESPONSE"
+fi
+
+# ------------------------------
+# PARSE STREAM DATA
+# ------------------------------
+
+IS_LIVE=$(echo "$RESPONSE" | jq -r '.data[0].type // empty')
+TITLE=$(echo "$RESPONSE" | jq -r '.data[0].title // empty')
+GAME=$(echo "$RESPONSE" | jq -r '.data[0].game_name // empty')
 URL="https://twitch.tv/$STREAMER"
-THUMBNAIL=$(echo "$RESPONSE" | jq -r '.data[0].thumbnail_url' | sed "s/{width}/1280/; s/{height}/720/")
+THUMBNAIL=$(echo "$RESPONSE" | jq -r '.data[0].thumbnail_url // empty' | sed "s/{width}/1280/; s/{height}/720/")
 
-# check if streamer $1 is live
-if [ "$IS_LIVE" == "live" ]; then
-    echo "$STREAMER is LIVE: $TITLE ($GAME)"
-    # Only send webhook if not already sent
+# ------------------------------
+# LIVE / OFFLINE HANDLING
+# ------------------------------
+
+if [ "$IS_LIVE" = "live" ]; then
+    log "$STREAMER is LIVE: $TITLE ($GAME)"
+
     if [ ! -f "$FLAG_FILE" ]; then
-        curl -s -X POST -H "Content-Type: application/json" \
+        retry_curl "$WEBHOOK_URL" \
+            -X POST -H "Content-Type: application/json" \
             -d "{
                 \"content\": \":skull: @everyone $STREAMER is actief aan het stromen op Twitch!\",
                 \"embeds\": [
@@ -64,20 +141,15 @@ if [ "$IS_LIVE" == "live" ]; then
                         \"image\": { \"url\": \"$THUMBNAIL\" }
                     }
                 ]
-            }" \
-            # discarding output
-            "$WEBHOOK_URL" >/dev/null
-        # Create the flag file after sending the webhook
+            }" >/dev/null
+
         touch "$FLAG_FILE"
+        log "Webhook sent and flag file created."
     fi
 
-    # exit success
     exit 0
 else
-    echo "$STREAMER is OFFLINE"
-    # Remove the flag so next live session triggers a new webhook
-    [ -f "$FLAG_FILE" ] && rm "$FLAG_FILE"
-    
-    # exit failure
+    log "$STREAMER is OFFLINE"
+    [ -f "$FLAG_FILE" ] && rm "$FLAG_FILE" && log "Flag file removed."
     exit 1
 fi
