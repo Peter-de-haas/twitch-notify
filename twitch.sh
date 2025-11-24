@@ -2,6 +2,7 @@
 # twitch_check.sh
 # Usage: ./twitch_check.sh <streamer_name>
 # Hardened version with logging, retries, and credential file
+# Token/flag auto-cleanup included
 
 set -euo pipefail
 IFS=$'\n\t'
@@ -12,10 +13,15 @@ IFS=$'\n\t'
 
 STREAMER="$1"
 CRED_FILE="/home/cronrunner/credentials/twitch-sh-credentials.conf"
-LOG_FILE="/var/log/twitch_check.log"
+LOG_FILE="$HOME/twitch_check.log"
 
+# Temp files
 TOKEN_FILE="/tmp/twitch_${STREAMER}_token.json"
 FLAG_FILE="/tmp/${STREAMER}_live.flag"
+
+# Cleanup config (seconds)
+TOKEN_MAX_AGE=$((24*60*60)) # 24 hours
+FLAG_MAX_AGE=$((48*60*60))  # 48 hours
 
 # ------------------------------
 # FUNCTIONS
@@ -31,7 +37,6 @@ error_exit() {
     exit 1
 }
 
-# Retry function for curl
 retry_curl() {
     local url="$1"
     shift
@@ -49,7 +54,6 @@ retry_curl() {
     error_exit "Curl failed after $retries attempts: $url"
 }
 
-# Generate a new Twitch API token
 get_token() {
     log "Requesting new Twitch token..."
     retry_curl "https://id.twitch.tv/oauth2/token" \
@@ -57,6 +61,19 @@ get_token() {
         -H "Content-Type: application/x-www-form-urlencoded" \
         -d "client_id=$CLIENT_ID&client_secret=$CLIENT_SECRET&grant_type=client_credentials" \
         > "$TOKEN_FILE"
+}
+
+cleanup_old_files() {
+    # Remove old token files
+    if [ -f "$TOKEN_FILE" ] && [ $(( $(date +%s) - $(stat -c %Y "$TOKEN_FILE") )) -ge $TOKEN_MAX_AGE ]; then
+        rm -f "$TOKEN_FILE"
+        log "Old token file removed."
+    fi
+    # Remove old flag files
+    if [ -f "$FLAG_FILE" ] && [ $(( $(date +%s) - $(stat -c %Y "$FLAG_FILE") )) -ge $FLAG_MAX_AGE ]; then
+        rm -f "$FLAG_FILE"
+        log "Old flag file removed."
+    fi
 }
 
 # ------------------------------
@@ -72,12 +89,17 @@ if [ ! -f "$CRED_FILE" ]; then
     error_exit "Credential file not found: $CRED_FILE"
 fi
 
-# Load credentials
 source "$CRED_FILE"
 
 : "${CLIENT_ID:?Missing CLIENT_ID in $CRED_FILE}"
 : "${CLIENT_SECRET:?Missing CLIENT_SECRET in $CRED_FILE}"
 : "${WEBHOOK_URL:?Missing WEBHOOK_URL in $CRED_FILE}"
+
+# ------------------------------
+# CLEANUP
+# ------------------------------
+
+cleanup_old_files
 
 # ------------------------------
 # TOKEN MANAGEMENT
@@ -106,7 +128,6 @@ RESPONSE=$(retry_curl "https://api.twitch.tv/helix/streams?user_login=$STREAMER"
     -H "Authorization: Bearer $ACCESS_TOKEN"
 )
 
-# Validate API response
 if ! echo "$RESPONSE" | jq -e '.data' >/dev/null 2>&1; then
     error_exit "Invalid Twitch API response: $RESPONSE"
 fi
