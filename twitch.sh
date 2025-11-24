@@ -1,8 +1,7 @@
 #!/bin/bash
 # twitch_check.sh
 # Usage: ./twitch_check.sh <streamer_name>
-# Hardened version with logging, retries, and credential file
-# Token/flag auto-cleanup included
+# Hardened version with daily logs, automatic cleanup, retries, and credential file
 
 set -euo pipefail
 IFS=$'\n\t'
@@ -13,7 +12,16 @@ IFS=$'\n\t'
 
 STREAMER="$1"
 CRED_FILE="/home/cronrunner/credentials/twitch-sh-credentials.conf"
-LOG_FILE="$HOME/logs/twitch_check.log"
+
+# Logs directory (daily logs)
+LOG_DIR="$HOME/logs"
+LOG_FILE="$LOG_DIR/twitch_check_$(date '+%Y-%m-%d').log"
+
+# Cleanup logs older than 7 days
+cleanup_old_logs() {
+    find "$LOG_DIR" -name "twitch_check_*.log" -type f -mtime +7 -exec rm -f {} \;
+}
+cleanup_old_logs
 
 # Temp files
 TOKEN_FILE="/tmp/twitch_${STREAMER}_token.json"
@@ -37,6 +45,7 @@ error_exit() {
     exit 1
 }
 
+# Retry function for curl requests
 retry_curl() {
     local url="$1"
     shift
@@ -89,6 +98,7 @@ if [ ! -f "$CRED_FILE" ]; then
     error_exit "Credential file not found: $CRED_FILE"
 fi
 
+# Load credentials
 source "$CRED_FILE"
 
 : "${CLIENT_ID:?Missing CLIENT_ID in $CRED_FILE}"
@@ -128,6 +138,7 @@ RESPONSE=$(retry_curl "https://api.twitch.tv/helix/streams?user_login=$STREAMER"
     -H "Authorization: Bearer $ACCESS_TOKEN"
 )
 
+# Validate API response
 if ! echo "$RESPONSE" | jq -e '.data' >/dev/null 2>&1; then
     error_exit "Invalid Twitch API response: $RESPONSE"
 fi
