@@ -13,7 +13,7 @@ IFS=$'\n\t'
 
 STREAMER="$1"
 CRED_FILE="/home/cronrunner/credentials/twitch-sh-credentials.conf"
-LOG_FILE="$HOME/twitch_check.log"
+LOG_FILE="$HOME/logs/twitch_check.log"
 
 # Temp files
 TOKEN_FILE="/tmp/twitch_${STREAMER}_token.json"
